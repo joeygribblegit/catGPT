@@ -1,72 +1,127 @@
 import os, json, base64, asyncio, time
+import logging
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 import websockets
 from dotenv import load_dotenv
+from datetime import datetime
+import pytz
 load_dotenv()
 
-# ⚠️ Use Python 3.12.x or earlier. If you're on 3.13+, install a resampler lib (e.g., "samplerate")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 try:
-    import audioop  # stdlib until 3.12
+    import audioop
 except ImportError:
     raise SystemExit("audioop not available (Python 3.13+). Use Python 3.12.x or add a resampler lib.")
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')  # set in your environment or .env
+# Configuration
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-mini-realtime-preview")
-OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")  # alloy, aria, verse, shimmer, coral...
-
-# System prompt configuration
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "alloy")
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "system_prompt.txt")
-
-# Greeting options
-USE_TWILIO_GREETING = os.getenv("USE_TWILIO_GREETING", "false").lower() == "true"
-USE_AI_GREETING = os.getenv("USE_AI_GREETING", "false").lower() == "true"
 GREETING_TEXT = os.getenv("GREETING_TEXT", "Hi, this is the Gribble's pet sitting assistant. What's up?")
 
-# Audio pipeline: Twilio 8k μ-law  <->  OpenAI PCM16 ~24k
+# Audio settings
 TWILIO_RATE_HZ = 8000
 OPENAI_PCM_RATE_HZ = 24000
 BYTES_PER_SAMPLE = 2
 
-# VAD / turn-taking knobs
+# Voice activity detection
 RMS_SPEECH = int(os.getenv("RMS_SPEECH", "1200"))
 END_SILENCE_MS = int(os.getenv("END_SILENCE_MS", "900"))
 MAX_UTTER_MS = int(os.getenv("MAX_UTTER_MS", "6000"))
 MAX_MODEL_TOKENS = int(os.getenv("MAX_MODEL_TOKENS", "400"))
 
-# Anti–double-greeting / empty-commit guards
+# Turn-taking settings
 CHUNK_MS = 20
 STARTUP_GRACE_MS = int(os.getenv("STARTUP_GRACE_MS", "1500"))
 MIN_SPEECH_MS = int(os.getenv("MIN_SPEECH_MS", "500"))
 MIN_COMMIT_MS = 120
 MIN_COMMIT_BYTES_PCM24 = int(OPENAI_PCM_RATE_HZ * (MIN_COMMIT_MS / 1000.0) * BYTES_PER_SAMPLE)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# Security
+PHONE_WHITELIST = [phone.strip() for phone in os.getenv("PHONE_WHITELIST", "").split(",") if phone.strip()]
 
 app = FastAPI()
+call_info_store = {}
 
-# TwiML: include <Say> only when USE_TWILIO_GREETING=true
-if USE_TWILIO_GREETING:
-    TWIML = """<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>{greeting}</Say>
-  <Connect><Stream url="wss://{host}/media"/></Connect>
-</Response>
-"""
-else:
-    TWIML = """<?xml version="1.0" encoding="UTF-8"?>
+TWIML = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect><Stream url="wss://{host}/media"/></Connect>
 </Response>
 """
+
+def get_pacific_time():
+    """Get current time in Pacific timezone."""
+    pacific_tz = pytz.timezone('US/Pacific')
+    return datetime.now(pacific_tz).strftime('%Y-%m-%d %H:%M:%S %Z')
+
+def format_duration(ms):
+    """Format duration in milliseconds to human readable format."""
+    seconds = ms / 1000
+    minutes = int(seconds // 60)
+    seconds = int(seconds % 60)
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+    else:
+        return f"{seconds}s"
+
+def is_phone_whitelisted(phone_number):
+    """Check if a phone number is in the whitelist."""
+    if not PHONE_WHITELIST:
+        logger.warning("No phone whitelist configured - allowing all calls")
+        return True
+    
+    normalized_phone = phone_number.replace("+1", "").replace(" ", "").replace("-", "")
+    
+    for whitelisted in PHONE_WHITELIST:
+        normalized_whitelisted = whitelisted.replace("+", "").replace(" ", "").replace("-", "")
+        if normalized_phone == normalized_whitelisted:
+            return True
+    return False
 
 @app.post("/voice")
 async def voice(request: Request):
     host = request.headers.get("host")
-    if USE_TWILIO_GREETING:
-        xml = TWIML.format(host=host, greeting=GREETING_TEXT)
-    else:
-        xml = TWIML.format(host=host)
+    
+    # Extract phone number information from Twilio request
+    form_data = await request.form()
+    from_number = form_data.get("From", "Unknown")
+    to_number = form_data.get("To", "Unknown")
+    call_sid = form_data.get("CallSid", "Unknown")
+    
+    # Check if phone number is whitelisted
+    if not is_phone_whitelisted(from_number):
+        pacific_time = get_pacific_time()
+        logger.warning(f"[{pacific_time}] UNAUTHORIZED CALL BLOCKED - From: {from_number}, To: {to_number}, CallSid: {call_sid}")
+        
+        # Return rejection TwiML
+        rejection_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Sorry, this number is not authorized to access this service. Goodbye.</Say>
+  <Hangup/>
+</Response>"""
+        return PlainTextResponse(rejection_xml, media_type="text/xml")
+    
+    # Store call information for WebSocket retrieval
+    call_info_store[call_sid] = {
+        "from_number": from_number,
+        "to_number": to_number,
+        "call_sid": call_sid
+    }
+    
+    # Log call connection with Pacific time (debug level)
+    pacific_time = get_pacific_time()
+    logger.debug(f"[{pacific_time}] CALL CONNECTED - From: {from_number}, To: {to_number}, CallSid: {call_sid}")
+    
+    xml = TWIML.format(host=host)
     return PlainTextResponse(xml, media_type="text/xml")
 
 
@@ -77,10 +132,10 @@ def load_system_prompt():
             with open(SYSTEM_PROMPT_FILE, 'r', encoding='utf-8') as f:
                 return f.read().strip()
         else:
-            print(f"System prompt file '{SYSTEM_PROMPT_FILE}' not found, using default prompt")
+            logger.warning(f"System prompt file '{SYSTEM_PROMPT_FILE}' not found, using default prompt")
             return "You are a concise, friendly voice assistant to answer any questions about the Gribble household."
     except Exception as e:
-        print(f"Error reading system prompt file: {e}, using default prompt")
+        logger.error(f"Error reading system prompt file: {e}, using default prompt")
         return "You are a concise, friendly voice assistant to answer any questions about the Gribble household."
 
 
@@ -163,7 +218,6 @@ async def media(ws_twilio: WebSocket):
     await ws_twilio.accept()
     ws_ai = await openai_connect()
 
-    # Per-connection converter state
     to_pcm24k, to_ulaw8k = make_converters()
 
     stream_sid = None
@@ -171,13 +225,11 @@ async def media(ws_twilio: WebSocket):
     have_speech = False
     turn_started_ms = 0.0
     last_speech_ms = 0.0
-
-    # anti-empty-commit / anti-early-commit trackers
     bytes_since_commit = 0
     call_start_ms = 0
     speech_ms_accum = 0
-
     greeted = False
+    call_info = {}
 
 
     async def downlink():
@@ -186,7 +238,6 @@ async def media(ws_twilio: WebSocket):
             async for msg in ws_ai:
                 evt = json.loads(msg)
                 et = evt.get("type")
-                # print("OPENAI EVENT:", et)
 
                 if et in ("response.output_audio.delta", "output_audio.delta", "response.audio.delta"):
                     audio_b64 = evt.get("delta") or evt.get("audio")
@@ -196,7 +247,7 @@ async def media(ws_twilio: WebSocket):
                     await ws_twilio.send_text(twilio_media(stream_sid, payload))
 
                 elif et == "error":
-                    print("OPENAI ERROR:", evt)
+                    logger.error(f"OpenAI error: {evt}")
 
                 elif et in ("response.completed", "response.refused", "response.done"):
                     nonlocal awaiting_reply, have_speech
@@ -204,7 +255,7 @@ async def media(ws_twilio: WebSocket):
                     have_speech = False
 
         except Exception as e:
-            print("OPENAI downlink closed:", e)
+            logger.error(f"OpenAI downlink closed: {e}")
             try:
                 await ws_ai.close()
             except:
@@ -220,12 +271,26 @@ async def media(ws_twilio: WebSocket):
             if ev == "start":
                 stream_sid = data["start"]["streamSid"]
                 call_start_ms = time.time() * 1000
-                # Optional: AI greeting in the model's own voice
-                if USE_AI_GREETING and not USE_TWILIO_GREETING and not greeted:
+                
+                call_sid = data.get("start", {}).get("callSid", "Unknown")
+                stored_info = call_info_store.get(call_sid, {})
+                
+                call_info = {
+                    "stream_sid": stream_sid,
+                    "start_time": call_start_ms,
+                    "from_number": stored_info.get("from_number", "Unknown"),
+                    "to_number": stored_info.get("to_number", "Unknown"),
+                    "call_sid": call_sid
+                }
+                
+                pacific_time = get_pacific_time()
+                logger.info(f"[{pacific_time}] CALL STARTED - From: {call_info['from_number']}, To: {call_info['to_number']}, CallSid: {call_info['call_sid']}")
+                
+                if not greeted:
                     greeted = True
-                    print(f"AI greeting (verbatim) queued: {GREETING_TEXT!r}")
+                    logger.info(f"AI greeting queued: {GREETING_TEXT!r}")
                     try:
-                        awaiting_reply = True  # block VAD commits during greeting
+                        awaiting_reply = True
                         await ws_ai.send(json.dumps({
                             "type": "response.create",
                             "response": {
@@ -235,7 +300,7 @@ async def media(ws_twilio: WebSocket):
                             }
                         }))
                     except Exception as e:
-                        print("Failed to send AI greeting:", e)
+                        logger.error(f"Failed to send AI greeting: {e}")
                         awaiting_reply = False
 
             elif ev == "media":
@@ -284,10 +349,25 @@ async def media(ws_twilio: WebSocket):
                     bytes_since_commit = 0
 
             elif ev == "stop":
+                # Log call disconnection with Pacific time and duration
+                if call_info:
+                    call_end_ms = time.time() * 1000
+                    call_duration_ms = call_end_ms - call_info["start_time"]
+                    pacific_time = get_pacific_time()
+                    duration_str = format_duration(call_duration_ms)
+                    logger.info(f"[{pacific_time}] CALL DISCONNECTED - From: {call_info['from_number']}, To: {call_info['to_number']}, CallSid: {call_info['call_sid']}, Duration: {duration_str}")
+                    call_info_store.pop(call_info['call_sid'], None)
                 break
 
     except WebSocketDisconnect:
-        pass
+        # Log call disconnection due to WebSocket disconnect
+        if call_info:
+            call_end_ms = time.time() * 1000
+            call_duration_ms = call_end_ms - call_info["start_time"]
+            pacific_time = get_pacific_time()
+            duration_str = format_duration(call_duration_ms)
+            logger.info(f"[{pacific_time}] CALL DISCONNECTED (WebSocket) - From: {call_info['from_number']}, To: {call_info['to_number']}, CallSid: {call_info['call_sid']}, Duration: {duration_str}")
+            call_info_store.pop(call_info['call_sid'], None)
     finally:
         # One last chance to flush, but only if there is real buffered audio
         try:
