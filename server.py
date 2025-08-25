@@ -16,10 +16,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress audioop deprecation warning for Python 3.12
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="audioop")
 try:
     import audioop
 except ImportError:
     raise SystemExit("audioop not available (Python 3.13+). Use Python 3.12.x or add a resampler lib.")
+
 
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
@@ -384,3 +388,6 @@ async def media(ws_twilio: WebSocket):
         task_downlink.cancel()
 
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5050)

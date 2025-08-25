@@ -67,3 +67,13 @@ cloudflared.log
 *.wav
 *.mp3
 *.m4a
+
+# Bazel
+bazel-*
+.bazel/
+bazel-bin/
+bazel-out/
+bazel-testlogs/
+bazel-genfiles/
+.bazelrc.user
+.bazelversion
